@@ -1,0 +1,17 @@
+{
+  "schema_version": "ain.geo-impact-fixtures.v1",
+  "cohort_id": "replace-with-a-new-cohort-id",
+  "cases": [
+    {
+      "case_id": "replace-with-case-id",
+      "changed_files": [
+        "src/changed.py"
+      ],
+      "max_hops": 0,
+      "sources": {
+        "src/changed.py": "def changed():\n    return 1\n",
+        "tests/test_changed.py": "from src.changed import changed\ndef test_changed():\n    return changed()\n"
+      }
+    }
+  ]
+}

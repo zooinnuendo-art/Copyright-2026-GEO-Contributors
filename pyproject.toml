@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geo-code-analysis"
+version = "0.1.0"
+description = "Experimental Python analyzer that surfaces review hotspots and candidate tests by comparing static dependencies with Git co-change history."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+geo-graph = "tools.code_dependency_graph:main"
+geo-history = "tools.git_temporal_history:main"
+geo-tension = "tools.geo_history_tension_probe:main"
+geo-demo = "examples.run_demo:main"
+
+[tool.setuptools]
+packages = ["tools", "examples"]
+
+[tool.setuptools.package-data]
+examples = ["shop/shop/*.py", "shop/tests/*.py"]

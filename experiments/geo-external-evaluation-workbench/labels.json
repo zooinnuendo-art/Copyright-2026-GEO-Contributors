@@ -1,0 +1,11 @@
+{
+  "cohort_id": "replace-with-a-new-cohort-id",
+  "fixtures_sha256": "320873da257fb074c4a78564cf30d009b6a369cbb3d06b3924fec5f0a4a8125c",
+  "labels": [
+    {
+      "case_id": "replace-with-case-id",
+      "expected_test_files": []
+    }
+  ],
+  "schema_version": "ain.geo-impact-labels.v1"
+}

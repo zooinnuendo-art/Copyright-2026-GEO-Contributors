@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      PYTHONUTF8: "1"
+      GIT_CONFIG_NOSYSTEM: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install editable project
+        run: python -m pip install -e .
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Run sample project test
+        working-directory: examples/shop
+        run: python -m unittest discover -s tests -v
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Replace editable install with wheel
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "geo-code-analysis"], check=True)
+          subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", str(wheels[0])], check=True)
+      - name: Verify installed commands outside checkout
+        working-directory: ${{ runner.temp }}
+        run: python "${{ github.workspace }}/scripts/check_installed.py"
