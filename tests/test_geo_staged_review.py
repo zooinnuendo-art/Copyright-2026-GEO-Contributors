@@ -85,12 +85,19 @@ class StagedReviewTests(unittest.TestCase):
                 self.staged()
 
     def test_unmerged_index_rejected(self):
-        oid = self.git("rev-parse", "HEAD:src/pkg/core.py")
-        subprocess.run(
-            ["git", "-C", str(self.root), "update-index", "--index-info"],
-            input=f"0 {'0' * 40}\tsrc/pkg/core.py\n100644 {oid} 1\tsrc/pkg/core.py\n100644 {oid} 2\tsrc/pkg/core.py\n",
-            text=True, check=True, capture_output=True,
+        current_branch = self.git("branch", "--show-current")
+        self.git("branch", "conflict-side")
+        self.write("src/pkg/core.py", "def run():\n    return 3\n")
+        self.commit()
+        self.git("checkout", "conflict-side")
+        self.write("src/pkg/core.py", "def run():\n    return 4\n")
+        self.commit()
+        self.git("checkout", current_branch)
+        conflict = subprocess.run(
+            ["git", "-C", str(self.root), "merge", "--no-edit", "conflict-side"],
+            text=True, capture_output=True,
         )
+        self.assertNotEqual(conflict.returncode, 0, conflict.stdout + conflict.stderr)
         with self.assertRaisesRegex(GitHistoryError, "unmerged"):
             self.staged()
 
