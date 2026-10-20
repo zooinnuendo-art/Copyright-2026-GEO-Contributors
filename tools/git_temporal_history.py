@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import subprocess
 import tempfile
 from typing import Any, Sequence
@@ -17,6 +17,54 @@ from tools.temporal_graph_history import build_temporal_snapshot_record
 
 class GitHistoryError(ValueError):
     """Raised when Git history cannot be read within the declared contract."""
+
+
+def _validate_git_python_path(path: str) -> PurePosixPath:
+    if not isinstance(path, str) or not path or "\0" in path or "\\" in path:
+        raise GitHistoryError("Git contains an unsafe Python path")
+    relative = PurePosixPath(path)
+    windows = PureWindowsPath(path)
+    components = path.split("/")
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if (
+        relative.is_absolute() or windows.is_absolute() or windows.drive
+        or not relative.parts or any(part in {"", ".", ".."} for part in components)
+        or any(
+            part.endswith((" ", "."))
+            or any(
+                character in '<>:"|?*'
+                or os.name == "nt" and (ord(character) < 32 or ord(character) == 127)
+                for character in part
+            )
+            or part.split(".", 1)[0].rstrip(" .").upper() in reserved
+            for part in components
+        )
+    ):
+        raise GitHistoryError("Git contains an unsafe Python path")
+    return relative
+
+
+def _validate_git_python_paths(paths: Sequence[str]) -> None:
+    files: dict[str, str] = {}
+    directories: set[str] = set()
+    for path in paths:
+        _validate_git_python_path(path)
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            prefix = "/".join(parts[:index]).casefold()
+            if prefix in files:
+                raise GitHistoryError("Git Python file path collides with a directory")
+            directories.add(prefix)
+        folded_path = path.casefold()
+        if folded_path in directories:
+            raise GitHistoryError("Git Python file path collides with a directory")
+        if folded_path in files and files[folded_path] != path:
+            raise GitHistoryError("Git Python paths collide on Windows")
+        files[folded_path] = path
 
 
 def _git(
@@ -111,9 +159,7 @@ def _tree_python_blobs(
             raise GitHistoryError("Git returned a malformed tree entry") from error
         if not path.endswith(".py"):
             continue
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise GitHistoryError("Git tree contains an unsafe Python path")
+        _validate_git_python_path(path)
         if object_type != "blob" or mode not in {"100644", "100755"}:
             issues.append({"kind": "unsupported_git_python_entry", "path": path, "mode": mode})
             continue
@@ -127,6 +173,7 @@ def _tree_python_blobs(
         if total_bytes > max_total_bytes:
             raise GitHistoryError("Python blob bytes exceeded the configured limit")
         blobs.append((path, object_id, size, mode))
+    _validate_git_python_paths([path for path, _object_id, _size, _mode in blobs])
     return blobs, issues
 
 
@@ -183,8 +230,12 @@ def _dependency_snapshot(
     max_edges: int,
     timeout_seconds: float,
     max_metadata_bytes: int,
+    source_roots: list[str] | None = None,
+    changed_files: list[str] | None = None,
+    include_import_use_test_fallback: bool = True,
+    snapshot_blobs: list[tuple[str, str, int, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, bytes], set[str], bool]:
-    blobs, extraction_issues = _tree_python_blobs(
+    blobs, extraction_issues = (snapshot_blobs, []) if snapshot_blobs is not None else _tree_python_blobs(
         repository,
         commit_id,
         max_files=max_files,
@@ -200,19 +251,29 @@ def _dependency_snapshot(
     )
     with tempfile.TemporaryDirectory(prefix="ain-git-snapshot-") as directory:
         root = Path(directory)
+        _validate_git_python_paths([path for path, _content, _mode in contents])
         for relative_name, content, _mode in contents:
-            relative = PurePosixPath(relative_name)
+            relative = _validate_git_python_path(relative_name)
             target = root.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.resolve().relative_to(root.resolve())
+            except ValueError as error:
+                raise GitHistoryError("Git Python path escapes the snapshot directory") from error
             target.write_bytes(content)
-        graph = build_dependency_graph(
-            root,
-            changed_files=[],
-            max_hops=0,
-            max_files=max_files,
-            max_nodes=max_nodes,
-            max_edges=max_edges,
-        )
+        try:
+            graph = build_dependency_graph(
+                root,
+                changed_files=changed_files or [],
+                max_hops=0,
+                max_files=max_files,
+                max_nodes=max_nodes,
+                max_edges=max_edges,
+                source_roots=source_roots,
+                include_import_use_test_fallback=include_import_use_test_fallback,
+            )
+        except ValueError as error:
+            raise GitHistoryError(f"snapshot {commit_id}: {error}") from error
     graph["root"] = f"git-tree://{tree_id}"
     if extraction_issues:
         graph["issues"] = sorted(
@@ -238,6 +299,8 @@ def _empty_ast_delta(paths: set[str], reason: str) -> dict[str, Any]:
     return {
         "symbols": {"added": [], "removed": [], "changed": []},
         "uncertain_files": sorted(paths),
+        "partially_uncertain_files": [],
+        "uncertain_symbols": [],
         "issues": [{"kind": "ast_delta_skipped_incomplete_snapshot", "reason": reason}],
         "source_text_retained": False,
     }
@@ -251,12 +314,15 @@ def _file_changes(
     timeout_seconds: float,
     max_metadata_bytes: int,
     max_files: int,
+    staged: bool = False,
 ) -> list[dict[str, Any]]:
+    command = ("diff", "--cached") if staged else ("diff-tree", "--no-commit-id", "-r")
+    revisions = (parent_id,) if staged else (parent_id, commit_id)
     raw = _git(
         repository,
-        ("diff-tree", "--no-commit-id", "-r", "--name-status", "-z",
+        command + ("--name-status", "-z",
          "--no-ext-diff", "--no-textconv", "--find-renames=50%", f"-l{max_files}",
-         "--diff-filter=ADMRT", parent_id, commit_id, "--"),
+         "--diff-filter=ADMRT", *revisions, "--"),
         timeout_seconds=timeout_seconds,
         output_limit_bytes=max_metadata_bytes,
     )
@@ -327,6 +393,7 @@ def extract_git_temporal_history(
     max_symbol_ast_nodes_per_file: int = 200000,
     timeout_seconds: float = 30.0,
     include_final_snapshot: bool = False,
+    source_roots: list[str] | None = None,
 ) -> dict[str, Any]:
     """Read a contiguous first-parent series without changing its repository."""
     repo = Path(repository).resolve()
@@ -383,6 +450,7 @@ def extract_git_temporal_history(
             max_edges=max_edges,
             timeout_seconds=timeout_seconds,
             max_metadata_bytes=max_metadata_bytes,
+            source_roots=source_roots,
         )
         previous_revision_id = baseline_revision_id
         previous_sequence_index = 0
@@ -399,6 +467,7 @@ def extract_git_temporal_history(
             max_edges=max_edges,
             timeout_seconds=timeout_seconds,
             max_metadata_bytes=max_metadata_bytes,
+            source_roots=source_roots,
         )
         sequence_index = start_index + input_index
         if previous_snapshot is None:
@@ -515,6 +584,8 @@ def extract_git_temporal_history(
     }
     if include_final_snapshot:
         result["final_snapshot"] = previous_snapshot
+    if source_roots:
+        result["selection"]["source_roots"] = previous_snapshot["source_roots"]
     return result
 
 
@@ -524,6 +595,7 @@ def main() -> None:
     parser.add_argument("revisions", nargs="+", help="Contiguous first-parent revisions, oldest first")
     parser.add_argument("--max-revisions", type=int, default=20)
     parser.add_argument("--max-files", type=int, default=1000)
+    parser.add_argument("--source-root", action="append", default=[], help="Import root relative to every committed Python snapshot; repeatable")
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-metadata-bytes", type=int, default=32 * 1024 * 1024)
     parser.add_argument("--max-nodes", type=int, default=20000)
@@ -532,19 +604,23 @@ def main() -> None:
     parser.add_argument("--max-symbol-ast-nodes-per-file", type=int, default=200000)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     arguments = parser.parse_args()
-    result = extract_git_temporal_history(
-        arguments.repository,
-        arguments.revisions,
-        max_revisions=arguments.max_revisions,
-        max_files=arguments.max_files,
-        max_total_bytes=arguments.max_total_bytes,
-        max_metadata_bytes=arguments.max_metadata_bytes,
-        max_nodes=arguments.max_nodes,
-        max_edges=arguments.max_edges,
-        max_ast_symbols_per_file=arguments.max_ast_symbols_per_file,
-        max_symbol_ast_nodes_per_file=arguments.max_symbol_ast_nodes_per_file,
-        timeout_seconds=arguments.timeout_seconds,
-    )
+    try:
+        result = extract_git_temporal_history(
+            arguments.repository,
+            arguments.revisions,
+            max_revisions=arguments.max_revisions,
+            max_files=arguments.max_files,
+            max_total_bytes=arguments.max_total_bytes,
+            max_metadata_bytes=arguments.max_metadata_bytes,
+            max_nodes=arguments.max_nodes,
+            max_edges=arguments.max_edges,
+            max_ast_symbols_per_file=arguments.max_ast_symbols_per_file,
+            max_symbol_ast_nodes_per_file=arguments.max_symbol_ast_nodes_per_file,
+            timeout_seconds=arguments.timeout_seconds,
+            source_roots=arguments.source_root,
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     print(json.dumps(result, ensure_ascii=True, sort_keys=True, indent=2))
 
 

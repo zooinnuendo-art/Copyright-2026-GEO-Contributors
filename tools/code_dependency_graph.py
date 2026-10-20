@@ -47,8 +47,16 @@ def _module_name(relative_path: Path) -> str:
 class PythonDependencyGraphBuilder:
     """Extract conservative syntax-level relations; this is not whole-program analysis."""
 
-    def __init__(self, root: Path, max_files: int = 1000, max_nodes: int = 20000, max_edges: int = 50000):
+    def __init__(self, root: Path, max_files: int = 1000, max_nodes: int = 20000, max_edges: int = 50000, source_roots: list[str] | None = None):
         self.root = root.resolve()
+        normalized_roots = set()
+        for value in source_roots or []:
+            relative = Path(value)
+            resolved = (self.root / relative).resolve()
+            if relative.is_absolute() or not resolved.is_relative_to(self.root) or not resolved.is_dir():
+                raise ValueError(f"source root must be an existing directory relative to snapshot root: {value}")
+            normalized_roots.add(resolved.relative_to(self.root).as_posix())
+        self.source_roots = sorted(normalized_roots)
         self.max_files = max_files
         self.max_nodes = max_nodes
         self.max_edges = max_edges
@@ -130,8 +138,15 @@ class PythonDependencyGraphBuilder:
         except OSError:
             return False
 
+    def _module_name(self, relative: Path) -> str:
+        # Prefer the most specific configured root; other files retain snapshot-relative names.
+        for root in sorted(self.source_roots, key=lambda value: (-len(Path(value).parts), value)):
+            if relative.is_relative_to(root):
+                return _module_name(relative.relative_to(root))
+        return _module_name(relative)
+
     def _import_specs(self, relative: Path, node: ast.AST) -> list[dict[str, Any]]:
-        source_module = _module_name(relative)
+        source_module = self._module_name(relative)
         if isinstance(node, ast.Import):
             imports = [(alias.name, alias.asname or alias.name.split(".")[0], None) for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -194,6 +209,48 @@ class PythonDependencyGraphBuilder:
 
     def _function_syntax_facts(self, function_id: str, file_id: str, function: ast.FunctionDef | ast.AsyncFunctionDef, module_name: str, module_globals: set[str]) -> dict[str, Any]:
         walked = list(ast.walk(function))
+        parents = {child: node for node in walked for child in ast.iter_child_nodes(node)}
+
+        def reference_details(node: ast.Name) -> dict[str, Any]:
+            current: ast.AST = node
+            expression: ast.expr = node
+            kinds = set()
+            while current in parents:
+                parent = parents[current]
+                if isinstance(parent, ast.Attribute) and parent.value is current and current is expression:
+                    expression = parent
+                if (
+                    isinstance(parent, ast.arg) and parent.annotation is current
+                    or isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and parent.returns is current
+                    or isinstance(parent, ast.AnnAssign) and parent.annotation is current
+                ):
+                    kinds.add("annotation")
+                if isinstance(parent, ast.Call):
+                    callee = self._expression_chain(parent.func)
+                    if (
+                        callee and (callee["attributes"][-1:] == ["cast"] or callee == {"base": "cast", "attributes": []})
+                        and parent.args and parent.args[0] is current
+                    ):
+                        kinds.add("cast_type_argument_syntax")
+                    if (
+                        isinstance(parent.func, ast.Name) and parent.func.id == "getattr"
+                        and parent.args and parent.args[0] is current
+                    ):
+                        kinds.add("dynamic_attribute_syntax")
+                    if parent.func is current and current is expression:
+                        kinds.add("call_target")
+                current = parent
+            chain = self._expression_chain(expression)
+            if chain and chain["attributes"]:
+                kinds.add("attribute_reference")
+                if chain["attributes"][-1].isupper():
+                    kinds.add("uppercase_attribute_syntax")
+            return {
+                "column": node.col_offset,
+                "expression": ast.unparse(expression),
+                "reference_kinds": sorted(kinds or {"name_reference"}),
+            }
+
         calls = []
         names = []
         declared_globals = set()
@@ -209,7 +266,10 @@ class PythonDependencyGraphBuilder:
             if isinstance(node, ast.Global):
                 declared_globals.update(node.names)
             elif isinstance(node, ast.Name):
-                names.append({"name": node.id, "context": type(node.ctx).__name__, "line": node.lineno})
+                names.append({
+                    "name": node.id, "context": type(node.ctx).__name__, "line": node.lineno,
+                    **reference_details(node),
+                })
             elif isinstance(node, ast.Call):
                 simple_name = node.func.id if isinstance(node.func, ast.Name) else None
                 chain = self._expression_chain(node.func) if isinstance(node.func, ast.Attribute) else None
@@ -361,7 +421,7 @@ class PythonDependencyGraphBuilder:
             for target in targets:
                 module_globals.update(node.id for node in ast.walk(target) if isinstance(node, ast.Name))
 
-        module_name = _module_name(relative)
+        module_name = self._module_name(relative)
 
         class Collector(ast.NodeVisitor):
             def __init__(collector_self) -> None:
@@ -553,7 +613,7 @@ class PythonDependencyGraphBuilder:
             ]
             return matches[0] if len(matches) == 1 else None
 
-        target_module = _module_name(Path(self.files[target_file]["path"]))
+        target_module = self._module_name(Path(self.files[target_file]["path"]))
         for prefix_length in range(len(attribute_parts), -1, -1):
             module_name = ".".join([target_module, *attribute_parts[:prefix_length]]).strip(".")
             module_file = self.module_to_file.get(module_name)
@@ -869,6 +929,7 @@ class PythonDependencyGraphBuilder:
                 "extractor_version": EXTRACTOR_VERSION,
                 "extractor_sha256": extractor_hash,
                 "root": str(self.root),
+                "source_roots": self.source_roots,
                 "python_version": list(sys.version_info[:3]),
                 "ast_version": getattr(ast, "__version__", "stdlib"),
                 "max_hops": max_hops,
@@ -898,6 +959,7 @@ class PythonDependencyGraphBuilder:
                             artifact_json = entry.get("artifact_json")
                             if (
                                 entry.get("artifact_schema_version") == FILE_ARTIFACT_SCHEMA_VERSION
+                                and envelope.get("source_roots", []) == self.source_roots
                                 and entry.get("extractor_sha256") == extractor_hash
                                 and entry.get("python_version") == list(sys.version_info[:3])
                                 and entry.get("ast_version") == getattr(ast, "__version__", "stdlib")
@@ -920,9 +982,9 @@ class PythonDependencyGraphBuilder:
                         if previous_hashes.get(path) != current_hashes.get(path)
                     }
                     changed_modules = sorted({
-                        _module_name(Path(path))
+                        self._module_name(Path(path))
                         for path in changed_paths
-                        if path.endswith(".py") and _module_name(Path(path))
+                        if path.endswith(".py") and self._module_name(Path(path))
                     })
                     affected_importers = set()
                     for importer_path, entry in previous_file_artifacts.items():
@@ -972,8 +1034,10 @@ class PythonDependencyGraphBuilder:
                 content = path.read_bytes()
             self.files[file_id] = {"path": relative.as_posix(), "sha256": _sha256(content)}
             self._add_node(file_id, "file", path=relative.as_posix(), sha256=_sha256(content))
-            module_name = _module_name(relative)
+            module_name = self._module_name(relative)
             if module_name:
+                if self.source_roots and module_name in self.module_to_file:
+                    raise ValueError(f"ambiguous local module {module_name}: {self.module_to_file[module_name]} and {file_id}")
                 self.module_to_file[module_name] = file_id
         self.local_roots = {name.split(".", 1)[0] for name in self.module_to_file}
         self.module_globals: dict[str, set[str]] = {}
@@ -1101,10 +1165,13 @@ class PythonDependencyGraphBuilder:
             ],
         }
         result["cache"] = cache_metadata
+        if self.source_roots:
+            result["source_roots"] = self.source_roots
         if cache_path is not None and cache_key is not None and result["status"] == "snapshot_only/review_required":
             cache_graph = {key: value for key, value in result.items() if key != "cache"}
             envelope = {
                 "cache_format_version": CACHE_FORMAT_VERSION,
+                "source_roots": self.source_roots,
                 "cache_key": cache_key,
                 "graph_sha256": _sha256(_canonical_json_bytes(cache_graph)),
                 "graph": cache_graph,
@@ -1128,7 +1195,7 @@ class PythonDependencyGraphBuilder:
             module_name
             for path in normalized
             if path.endswith(".py")
-            for module_name in [ _module_name(Path(path)) ]
+            for module_name in [ self._module_name(Path(path)) ]
             if module_name
         })
         if not changed_modules:
@@ -1137,7 +1204,7 @@ class PythonDependencyGraphBuilder:
         for file_id, file in self.files.items():
             file_path = file["path"]
             for target_file, _ in self.import_aliases.get(file_id, {}).values():
-                target_module = _module_name(Path(self.files[target_file]["path"])) if target_file in self.files else ""
+                target_module = self._module_name(Path(self.files[target_file]["path"])) if target_file in self.files else ""
                 if any(target_module == module_name or target_module.startswith(f"{module_name}.") for module_name in changed_modules):
                     affected_importers.add(file_path)
                     break
@@ -1255,8 +1322,10 @@ class PythonDependencyGraphBuilder:
                 linked_test_files.add(test_file)
                 scoped_nodes.update(self.node_ids_by_path.get(source_node["path"], []))
 
+        fallback_evidence: dict[str, dict[str, Any]] = {}
         if include_import_use_test_fallback:
             test_references_by_file: dict[str, set[str]] = defaultdict(set)
+            reference_facts_by_file: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for function in self.function_data:
                 if function["node_type"] != "test":
                     continue
@@ -1276,13 +1345,27 @@ class PythonDependencyGraphBuilder:
                     if call["simple_name"]
                     and call["simple_name"] not in function.get("local_bindings", [])
                 )
+                reference_facts_by_file[function["path"]].extend(
+                    {
+                        "test_node": function["function_id"],
+                        "alias": name["name"],
+                        "line": name["line"],
+                        "column": name["column"],
+                        "name_context": name["context"],
+                        "expression": name["expression"],
+                        "reference_kinds": name["reference_kinds"],
+                    }
+                    for name in function["names"]
+                    if name["name"] not in function.get("local_bindings", [])
+                    and (name["name"], name["line"]) not in shadowed_getattr_refs
+                )
             scoped_modules = {
-                _module_name(Path(path))
+                self._module_name(Path(path))
                 for path in scoped_paths
                 if path.endswith(".py")
             }
             changed_modules = {
-                _module_name(Path(path))
+                self._module_name(Path(path))
                 for path in normalized
                 if path.endswith(".py")
             }
@@ -1292,7 +1375,8 @@ class PythonDependencyGraphBuilder:
                 if test_path not in test_references_by_file:
                     continue
                 references = test_references_by_file[test_path]
-                if any(
+                matching_imports = [
+                    spec for spec in imports if
                     spec.get("alias") in references
                     and any(
                         module_name
@@ -1305,15 +1389,46 @@ class PythonDependencyGraphBuilder:
                         )
                         for module_name in candidate_modules
                     )
-                    for spec in imports
-                ):
+                ]
+                if matching_imports:
                     test_file = f"file:{test_path}"
                     linked_test_files.add(test_file)
                     scoped_nodes.update(self.node_ids_by_path.get(test_path, []))
+                    records = []
+                    count = 0
+                    for spec in matching_imports:
+                        for reference in sorted(
+                            reference_facts_by_file[test_path],
+                            key=lambda item: (item["line"], item["column"], item["test_node"]),
+                        ):
+                            if reference["alias"] != spec["alias"]:
+                                continue
+                            count += 1
+                            if len(records) < 20:
+                                records.append({
+                                    **reference,
+                                    "import_module": spec["module"],
+                                    "import_symbol": spec["symbol"],
+                                    "import_line": spec["line"],
+                                    "matched_modules": sorted(
+                                        module for module in candidate_modules
+                                        if module and (
+                                            spec["module"] == module
+                                            or spec["symbol"] and f'{spec["module"]}.{spec["symbol"]}' == module
+                                        )
+                                    ),
+                                })
+                    fallback_evidence[test_path] = {
+                        "records": records,
+                        "record_count": count,
+                        "truncated": count > len(records),
+                        "evidence_kind": "syntactic_import_reference_not_runtime_proof",
+                    }
         return ({
             "files": sorted(self.files[file_id]["path"] for file_id in scoped_files | linked_test_files),
             "distances": {self.files[file_id]["path"]: distance for file_id, distance in sorted(distances.items())},
             "linked_test_files": sorted(self.files[file_id]["path"] for file_id in linked_test_files),
+            "import_use_fallback_evidence": fallback_evidence,
             "node_ids": sorted(scoped_nodes),
         }, issues)
 
@@ -1328,8 +1443,9 @@ def build_dependency_graph(
     cache_path: str | Path | None = None,
     recompute_affected_importers: bool = False,
     include_import_use_test_fallback: bool = True,
+    source_roots: list[str] | None = None,
 ) -> dict[str, Any]:
-    builder = PythonDependencyGraphBuilder(Path(root), max_files=max_files, max_nodes=max_nodes, max_edges=max_edges)
+    builder = PythonDependencyGraphBuilder(Path(root), max_files=max_files, max_nodes=max_nodes, max_edges=max_edges, source_roots=source_roots)
     return builder.build(
         changed_files=changed_files,
         max_hops=max_hops,
@@ -1343,6 +1459,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="Python source snapshot root")
     parser.add_argument("--changed", action="append", default=[], help="Changed path relative to root; repeatable")
+    parser.add_argument("--source-root", action="append", default=[], help="Import source directory relative to root; repeatable (for example src)")
     parser.add_argument("--max-hops", type=int, default=2)
     parser.add_argument("--max-files", type=int, default=1000)
     parser.add_argument("--max-nodes", type=int, default=20000)
@@ -1352,17 +1469,21 @@ def main() -> None:
     parser.add_argument("--no-import-use-test-fallback", action="store_false", dest="include_import_use_test_fallback", help="Disable test selection based on use of imports from scoped modules")
     parser.set_defaults(include_import_use_test_fallback=True)
     arguments = parser.parse_args()
-    result = build_dependency_graph(
-        arguments.root,
-        changed_files=arguments.changed,
-        max_hops=arguments.max_hops,
-        max_files=arguments.max_files,
-        max_nodes=arguments.max_nodes,
-        max_edges=arguments.max_edges,
-        cache_path=arguments.cache,
-        recompute_affected_importers=arguments.recompute_affected_importers,
-        include_import_use_test_fallback=arguments.include_import_use_test_fallback,
-    )
+    try:
+        result = build_dependency_graph(
+            arguments.root,
+            changed_files=arguments.changed,
+            max_hops=arguments.max_hops,
+            max_files=arguments.max_files,
+            max_nodes=arguments.max_nodes,
+            max_edges=arguments.max_edges,
+            cache_path=arguments.cache,
+            recompute_affected_importers=arguments.recompute_affected_importers,
+            include_import_use_test_fallback=arguments.include_import_use_test_fallback,
+            source_roots=arguments.source_root,
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     print(json.dumps(result, sort_keys=True, indent=2))
 
 

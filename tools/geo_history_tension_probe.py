@@ -251,6 +251,7 @@ def main() -> None:
     parser.add_argument("--revisions", nargs="+", help="Contiguous first-parent revisions, oldest first")
     parser.add_argument("--max-revisions", type=int, default=20)
     parser.add_argument("--max-files", type=int, default=1000)
+    parser.add_argument("--source-root", action="append", default=[], help="Import root relative to committed snapshots; repository mode only, repeatable")
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-metadata-bytes", type=int, default=32 * 1024 * 1024)
     parser.add_argument("--max-nodes", type=int, default=20000)
@@ -291,9 +292,12 @@ def main() -> None:
                 max_symbol_ast_nodes_per_file=args.max_symbol_ast_nodes_per_file,
                 timeout_seconds=args.timeout_seconds,
                 include_final_snapshot=True,
+                source_roots=args.source_root,
             )
             graph = history.pop("final_snapshot")
         else:
+            if args.source_root:
+                raise ValueError("--source-root requires --repository; JSON inputs are already extracted")
             if args.revisions is not None or args.graph is None or args.history is None:
                 raise ValueError("provide either --repository with --revisions, or both --graph and --history")
             graph = _read_cli_document(args.graph, args.max_input_bytes)
@@ -321,6 +325,8 @@ def main() -> None:
                 "snapshot_alignment": "same_extraction",
                 "working_tree_used": False,
             }
+            if args.source_root:
+                result["source"]["source_roots"] = graph["source_roots"]
     except (OSError, UnicodeError, ValueError) as error:
         parser.error(str(error))
     print(
