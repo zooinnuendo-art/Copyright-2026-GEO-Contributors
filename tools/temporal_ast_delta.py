@@ -145,8 +145,7 @@ def _parse_file_symbols(
 
     if len(symbols) > max_symbols:
         raise ValueError(f"AST symbol budget exceeded for {path}")
-    if duplicates:
-        return {}, duplicates
+    ambiguous_names = {issue["symbol_id"].split(":", 2)[2] for issue in duplicates}
 
     counted_nodes = [full_tree_nodes]
     summaries = {
@@ -160,8 +159,13 @@ def _parse_file_symbols(
             ),
         }
         for symbol_id, (kind, node) in sorted(symbols.items())
+        if not any(
+            symbol_id.split(":", 2)[2] == name
+            or symbol_id.split(":", 2)[2].startswith(name + ".")
+            for name in ambiguous_names
+        )
     }
-    return summaries, []
+    return summaries, duplicates
 
 
 def build_python_ast_delta(
@@ -173,7 +177,7 @@ def build_python_ast_delta(
     max_symbols_per_file: int = 10000,
     max_symbol_ast_nodes_per_file: int = 200000,
 ) -> dict[str, Any]:
-    """Compare symbol AST summaries; omit paths whose extraction is uncertain."""
+    """Compare unique symbols, excluding ambiguous IDs on both sides."""
     paths = set(parent_sources) | set(current_sources) | set(uncertain_paths)
     if len(paths) > max_files:
         raise ValueError("AST file budget exceeded")
@@ -183,6 +187,8 @@ def build_python_ast_delta(
     parent_symbols: dict[str, dict[str, Any]] = {}
     current_symbols: dict[str, dict[str, Any]] = {}
     uncertain = set(uncertain_paths)
+    partially_uncertain = set()
+    uncertain_symbols = set()
     issues = [
         {"kind": "ast_delta_skipped_uncertain_path", "path": path}
         for path in sorted(uncertain_paths)
@@ -206,7 +212,23 @@ def build_python_ast_delta(
             uncertain.add(path)
             issues.extend(before_issues)
             issues.extend(after_issues)
-            continue
+            file_issues = before_issues + after_issues
+            if any(issue["kind"] != "duplicate_symbol_id" for issue in file_issues):
+                continue
+            partially_uncertain.add(path)
+            ambiguous_ids = {issue["symbol_id"] for issue in file_issues}
+            ambiguous_names = {symbol_id.split(":", 2)[2] for symbol_id in ambiguous_ids}
+            excluded_ids = ambiguous_ids | {
+                symbol_id for symbol_id in set(before) | set(after)
+                if any(
+                    symbol_id.split(":", 2)[2] == name
+                    or symbol_id.split(":", 2)[2].startswith(name + ".")
+                    for name in ambiguous_names
+                )
+            }
+            uncertain_symbols.update(excluded_ids)
+            before = {symbol_id: summary for symbol_id, summary in before.items() if symbol_id not in excluded_ids}
+            after = {symbol_id: summary for symbol_id, summary in after.items() if symbol_id not in excluded_ids}
         parent_symbols.update(before)
         current_symbols.update(after)
 
@@ -228,6 +250,8 @@ def build_python_ast_delta(
             ],
         },
         "uncertain_files": sorted(uncertain),
+        "partially_uncertain_files": sorted(partially_uncertain),
+        "uncertain_symbols": sorted(uncertain_symbols),
         "issues": issues,
         "source_text_retained": False,
     }

@@ -183,8 +183,12 @@ def _dependency_snapshot(
     max_edges: int,
     timeout_seconds: float,
     max_metadata_bytes: int,
+    source_roots: list[str] | None = None,
+    changed_files: list[str] | None = None,
+    include_import_use_test_fallback: bool = True,
+    snapshot_blobs: list[tuple[str, str, int, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, bytes], set[str], bool]:
-    blobs, extraction_issues = _tree_python_blobs(
+    blobs, extraction_issues = (snapshot_blobs, []) if snapshot_blobs is not None else _tree_python_blobs(
         repository,
         commit_id,
         max_files=max_files,
@@ -205,14 +209,19 @@ def _dependency_snapshot(
             target = root.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
-        graph = build_dependency_graph(
-            root,
-            changed_files=[],
-            max_hops=0,
-            max_files=max_files,
-            max_nodes=max_nodes,
-            max_edges=max_edges,
-        )
+        try:
+            graph = build_dependency_graph(
+                root,
+                changed_files=changed_files or [],
+                max_hops=0,
+                max_files=max_files,
+                max_nodes=max_nodes,
+                max_edges=max_edges,
+                source_roots=source_roots,
+                include_import_use_test_fallback=include_import_use_test_fallback,
+            )
+        except ValueError as error:
+            raise GitHistoryError(f"snapshot {commit_id}: {error}") from error
     graph["root"] = f"git-tree://{tree_id}"
     if extraction_issues:
         graph["issues"] = sorted(
@@ -238,6 +247,8 @@ def _empty_ast_delta(paths: set[str], reason: str) -> dict[str, Any]:
     return {
         "symbols": {"added": [], "removed": [], "changed": []},
         "uncertain_files": sorted(paths),
+        "partially_uncertain_files": [],
+        "uncertain_symbols": [],
         "issues": [{"kind": "ast_delta_skipped_incomplete_snapshot", "reason": reason}],
         "source_text_retained": False,
     }
@@ -251,12 +262,15 @@ def _file_changes(
     timeout_seconds: float,
     max_metadata_bytes: int,
     max_files: int,
+    staged: bool = False,
 ) -> list[dict[str, Any]]:
+    command = ("diff", "--cached") if staged else ("diff-tree", "--no-commit-id", "-r")
+    revisions = (parent_id,) if staged else (parent_id, commit_id)
     raw = _git(
         repository,
-        ("diff-tree", "--no-commit-id", "-r", "--name-status", "-z",
+        command + ("--name-status", "-z",
          "--no-ext-diff", "--no-textconv", "--find-renames=50%", f"-l{max_files}",
-         "--diff-filter=ADMRT", parent_id, commit_id, "--"),
+         "--diff-filter=ADMRT", *revisions, "--"),
         timeout_seconds=timeout_seconds,
         output_limit_bytes=max_metadata_bytes,
     )
@@ -327,6 +341,7 @@ def extract_git_temporal_history(
     max_symbol_ast_nodes_per_file: int = 200000,
     timeout_seconds: float = 30.0,
     include_final_snapshot: bool = False,
+    source_roots: list[str] | None = None,
 ) -> dict[str, Any]:
     """Read a contiguous first-parent series without changing its repository."""
     repo = Path(repository).resolve()
@@ -383,6 +398,7 @@ def extract_git_temporal_history(
             max_edges=max_edges,
             timeout_seconds=timeout_seconds,
             max_metadata_bytes=max_metadata_bytes,
+            source_roots=source_roots,
         )
         previous_revision_id = baseline_revision_id
         previous_sequence_index = 0
@@ -399,6 +415,7 @@ def extract_git_temporal_history(
             max_edges=max_edges,
             timeout_seconds=timeout_seconds,
             max_metadata_bytes=max_metadata_bytes,
+            source_roots=source_roots,
         )
         sequence_index = start_index + input_index
         if previous_snapshot is None:
@@ -515,6 +532,8 @@ def extract_git_temporal_history(
     }
     if include_final_snapshot:
         result["final_snapshot"] = previous_snapshot
+    if source_roots:
+        result["selection"]["source_roots"] = previous_snapshot["source_roots"]
     return result
 
 
@@ -524,6 +543,7 @@ def main() -> None:
     parser.add_argument("revisions", nargs="+", help="Contiguous first-parent revisions, oldest first")
     parser.add_argument("--max-revisions", type=int, default=20)
     parser.add_argument("--max-files", type=int, default=1000)
+    parser.add_argument("--source-root", action="append", default=[], help="Import root relative to every committed Python snapshot; repeatable")
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-metadata-bytes", type=int, default=32 * 1024 * 1024)
     parser.add_argument("--max-nodes", type=int, default=20000)
@@ -532,19 +552,23 @@ def main() -> None:
     parser.add_argument("--max-symbol-ast-nodes-per-file", type=int, default=200000)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     arguments = parser.parse_args()
-    result = extract_git_temporal_history(
-        arguments.repository,
-        arguments.revisions,
-        max_revisions=arguments.max_revisions,
-        max_files=arguments.max_files,
-        max_total_bytes=arguments.max_total_bytes,
-        max_metadata_bytes=arguments.max_metadata_bytes,
-        max_nodes=arguments.max_nodes,
-        max_edges=arguments.max_edges,
-        max_ast_symbols_per_file=arguments.max_ast_symbols_per_file,
-        max_symbol_ast_nodes_per_file=arguments.max_symbol_ast_nodes_per_file,
-        timeout_seconds=arguments.timeout_seconds,
-    )
+    try:
+        result = extract_git_temporal_history(
+            arguments.repository,
+            arguments.revisions,
+            max_revisions=arguments.max_revisions,
+            max_files=arguments.max_files,
+            max_total_bytes=arguments.max_total_bytes,
+            max_metadata_bytes=arguments.max_metadata_bytes,
+            max_nodes=arguments.max_nodes,
+            max_edges=arguments.max_edges,
+            max_ast_symbols_per_file=arguments.max_ast_symbols_per_file,
+            max_symbol_ast_nodes_per_file=arguments.max_symbol_ast_nodes_per_file,
+            timeout_seconds=arguments.timeout_seconds,
+            source_roots=arguments.source_root,
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     print(json.dumps(result, ensure_ascii=True, sort_keys=True, indent=2))
 
 

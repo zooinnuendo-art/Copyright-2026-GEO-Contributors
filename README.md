@@ -106,6 +106,41 @@ The JSON contains `nodes`, `edges`, `status`, `issues`, and
 `scope.linked_test_files`. These are candidate tests, not generated tests or
 guaranteed impact coverage.
 
+For a `src/` layout, explicitly set the import source root:
+
+```sh
+geo-graph /path/to/project --source-root src --changed src/pkg/core.py
+python3 -m tools.geo_boundary_transition_probe /path/to/project \
+  --source-root src --changed src/pkg/core.py --extra-call-hops 2
+```
+
+The snapshot API `build_dependency_graph(..., source_roots=["src"])` and these
+two CLIs accept source roots. The history API
+`extract_git_temporal_history(..., source_roots=["src"])`, `geo-history`, and
+repository-mode `geo-tension` accept the same option:
+
+```sh
+geo-history /path/to/project COMMIT_A COMMIT_B --source-root src
+geo-tension --repository /path/to/project --revisions COMMIT_A COMMIT_B \
+  --source-root src
+```
+
+History uses the same roots for every revision and the comparison parent.
+Each root must exist in every extracted Python snapshot (contain an included
+Python file); absent roots fail explicitly with the commit ID. Roots are not
+validated against the working tree, nor automatically followed across root
+directory moves. JSON-input tension mode rejects `--source-root` because its
+graphs are already extracted. Configured roots are recorded in history
+selection and repository-mode tension provenance.
+Roots are existing directories relative to the snapshot root and may be repeated.
+The most specific matching root determines a file's module name; files outside
+those roots retain snapshot-relative module names. File paths and node IDs remain
+snapshot-relative, including `--changed` paths. No source-root autodetection,
+`sys.path` execution, or external package loading is performed. Ambiguous module
+names across files are rejected when roots are explicitly configured. Cache
+identity and artifact reuse account for source-root configuration.
+Without this option, module naming is unchanged.
+
 For history analysis, choose two or more consecutive first-parent commits
 (a single commit is also accepted and compared with its parent):
 
@@ -171,6 +206,279 @@ python3 -m tools.git_temporal_history /path/to/repository COMMIT_A COMMIT_B
 
 Commands do not implicitly analyze AIN. External repositories are supplied
 explicitly as inputs; synthetic benchmarks use temporary fixtures.
+
+## Local Experimental Boundary Transitions
+
+### One-Command Committed Change Review
+
+From this development checkout:
+
+```sh
+python3 -m tools.geo_change_review /path/to/repository \
+  --revision COMMIT --source-root src
+python3 -m tools.geo_change_review /path/to/repository \
+  --revision COMMIT --source-root src --format json
+```
+
+This local experimental CLI compares the selected commit against its first
+parent (including for merges); root commits are rejected. It reads committed
+Git objects only, never imports target packages, executes tests, modifies the
+working tree, or posts to a remote. No installed console entry point is added.
+Source-root configuration applies to both committed Python snapshots.
+
+Changed Python files outside `tests/` and `testing/`, excluding filenames
+`test_*.py` and `*_test.py`, seed file-level production scope at zero hops.
+This is a naming heuristic, not framework test discovery. Deleted production
+paths remain seeds for fallback review and retain missing-path warnings.
+Test-only/non-Python-only changes explicitly report
+`no_production_python_changes`, with `review: null`; selection was not run.
+
+Text summarizes changed symbols, candidate provenance, direct-reference kinds
+and uncertainty. JSON preserves full AST delta, reference records, graph issues,
+boundaries and continuation evidence. Rename-aware AST deltas are used when
+available. Optional `--extra-call-hops` and `--max-extra-visits` have the same
+default-off continuation semantics as the boundary probe. Candidate ordering
+is not a priority ranking and no tests are automatically removed or run.
+
+`--max-files`, `--max-total-bytes`, `--max-metadata-bytes`, `--max-nodes`,
+`--max-edges`, and `--timeout-seconds` bound extraction using existing history
+contracts. History and candidate-scope graphs are extracted separately from
+the pinned commit/tree and their node/edge identity is verified. Limits apply
+per extraction/Git command, not as a global runtime guarantee. Successful
+analysis exits 0 even with incomplete evidence; invalid input or extraction
+failure exits 2 with stderr and no successful JSON stdout.
+
+The installed-wheel check also runs committed and partially staged review
+from outside the checkout with isolated Python (`-I`). It verifies source-root
+resolution, changed-function evidence and unchanged index, worktree, HEAD and
+Git object counts. The CI matrix runs this same check on Python 3.10–3.14 and
+Linux/macOS/Windows when the workflow is executed. Local validation on one
+platform is not evidence that the full matrix has passed.
+
+For a pre-commit review of staged changes only:
+
+```sh
+python3 -m tools.geo_change_review /path/to/repository \
+  --staged --source-root src
+```
+
+`--staged` and `--revision` are mutually exclusive. Staged mode compares HEAD
+with stage-0 index blob IDs, not filesystem contents. Partially staged files
+use their indexed contents; unstaged and untracked files do not enter the
+snapshot. The tool does not write the index, working tree, commits or Git
+objects, and does not run hooks. Empty/test-only staged changes explicitly skip
+candidate selection. Staged renames use Git's similarity heuristic and
+rename-normalized AST comparison; staged deletions retain missing-provider
+warnings and fallback candidates where available.
+
+Staged mode requires an existing HEAD and rejects unmerged entries and
+unsupported Python entries (such as symlinks). Intent-to-add entries follow
+Git's cached-diff semantics and are not staged change seeds. Source-root
+directories must be represented in both Python snapshots. `source.commit_id`
+and `source.tree_id` are null for staged mode; `comparison_parent_id` identifies
+HEAD and `index_entries_sha256` fingerprints the captured index-entry listing.
+HEAD and that listing are rechecked before returning; changes fail explicitly.
+This is not a lock or atomic filesystem snapshot, and a change-and-revert
+during analysis cannot be detected. Index bytes and working-tree contents are
+not used as source code.
+
+This opt-in research probe compares the same snapshot with import-use test
+fallback off/on. Run it from this development checkout:
+
+```sh
+python3 -m tools.geo_boundary_transition_probe /path/to/project \
+  --changed pkg/core.py --max-hops 0
+```
+
+The two extractions must agree on nodes, edges, issues, status, incomplete
+causes, and production scope. Divergence fails explicitly instead of comparing
+incompatible evidence. This is a consistency check, not an atomic filesystem
+snapshot; use a stable source snapshot.
+
+`boundary_entries` preserves call-depth issues, including their terminal and
+untraversed nodes, even when no test was selected. `candidate_tests` records
+static versus fallback provenance, zero or one candidate-layer transition,
+known static meeting evidence, and retained boundaries. Added fallback
+candidates remain `review_required`; transitions never erase
+uncertainty. `comparison` reports candidate counts and added candidates with
+boundary evidence. No test oracle or effectiveness metric is inferred.
+
+The snapshot's `scope.import_use_fallback_evidence` maps each test file matched
+by import-use fallback to provenance. The transition probe copies that
+file's evidence into `candidate_tests[].import_use_fallback_evidence` (or `null`
+when no import-use match exists). Evidence is also retained when the candidate
+already has a static route; it does not imply fallback added that candidate.
+Each entry contains up to 20 deterministic `records`, the unsampled
+`record_count`, and a `truncated` flag. Counts are import/reference matches, not
+distinct runtime dependencies. Records identify the test node, import module,
+symbol/line, matching scoped or changed modules, reference line/zero-based AST
+byte column, name context, expression, and `reference_kinds`:
+
+- `annotation`: a name within an AST annotation, not proof of runtime type use.
+- `cast_type_argument_syntax`: within the first positional argument of a
+  syntactic `cast(...)` or `*.cast(...)`; the callee is not verified as `typing.cast`.
+- `attribute_reference` / `uppercase_attribute_syntax`: attribute access and
+  an uppercase final attribute, not proof that the attribute is a constant.
+- `dynamic_attribute_syntax`: within the object argument of `getattr(...)`;
+  no dynamic target or built-in identity is inferred.
+- `call_target` / `name_reference`: callable-position or other name syntax.
+
+Kinds can overlap. String annotations and embedded source strings are not
+expanded. Existing conservative name/import matching is unchanged: nested
+scopes, import aliases, and dotted imports sharing a root name can yield
+ambiguous matches. In particular, this evidence does not establish a module
+`__getattr__` route, resolve fixture injection, prove lexical binding or runtime
+dependency, exclude tests, or change ranking.
+
+For an existing AST delta from the same comparison, use
+`analyze_boundary_transitions(..., ast_delta=record["ast_delta"])` or
+`--ast-delta delta.json` (the delta object, not the full history document).
+This adds display-only `changed_symbol_alignment` to each candidate:
+
+- `direct_symbol_reference`: an existing test node's call, type, read or write
+  edge targets an exact added/changed/removed symbol ID in the changed files.
+  The relation is reported; type edges do not imply runtime calls.
+- `file_level_relation`: import-use evidence exists, but no such direct edge
+  is recorded. This does not rule out indirect or dynamic symbol dependence.
+- `undetermined`: missing/truncated evidence, type/dynamic syntax, or an
+  uncertain/empty symbol delta prevents finer classification.
+
+The caller must align the delta with the analyzed snapshot; a standalone
+delta has no commit identity to verify automatically. Renames should use the
+history record's `ast_delta["rename_aware"]` when present so paths match the
+current snapshot. Only symbols in `scope.changed_files` are considered;
+unchanged symbol bodies, module-level import changes, decorators and dynamic
+dispatch may not be represented by a changed-symbol ID. No transitive symbol
+search, runtime impact proof, candidate removal or ranking adjustment occurs.
+Omitting the delta omits this additional classification.
+
+`changed_symbol_alignment.direct_match_details` further distinguishes
+`changed_function_call`, `changed_variable_read`, `changed_variable_write`,
+`changed_class_type_reference`, `changed_class_call`, and
+`other_direct_symbol_reference`. `direct_reference_kinds` summarizes these
+kinds without changing `classification` or the existing `direct_matches`.
+For a class/function with changed descendant IDs, details include
+`changed_descendant_symbol_ids` and
+`container_ast_includes_changed_descendants: true`. This says the container's
+whole-subtree AST includes those changes; it does not establish that its own
+signature changed, that descendants caused all its changes, or that the test
+references a changed descendant. `reference_to_changed_descendant_proven`
+remains false for that container match. Missing descendant IDs do not prove
+the absence of nested changes (some may be ambiguous/excluded). Calls are
+known static edges, not proof of execution. No numerical confidence, candidate
+filtering or ranking change is introduced.
+
+AST deltas preserve unique symbols even if another definition in the file has
+a duplicate symbol ID (for example overloads, conditional definitions or a
+property getter/setter). `uncertain_files` remains a conservative audit list
+including both fully and partially uncertain files. `partially_uncertain_files`
+identifies files where duplicate IDs were the only extraction issue.
+`uncertain_symbols` lists excluded duplicate IDs and known descendants.
+An ambiguity on either side excludes that qualified name and descendants on
+both sides, preventing spurious additions/removals. Unique siblings remain
+comparable. A unique enclosing class/function retains its whole-subtree AST
+summary, so its change can include edits inside an ambiguous descendant; it
+does not identify which duplicate implementation changed. Syntax/read errors
+and explicitly uncertain paths still abstain for the whole file.
+Symbol alignment can use retained unique IDs while reporting
+`delta_partially_uncertain`; it never treats excluded IDs as direct matches.
+
+This is a first evidence-accounting prototype inspired by boundary/layer
+transitions, not a Möbius geometry implementation. It does not reconnect graph
+boundaries, infer dynamic edges, integrate history into routes, apply cosine
+weights, or change existing Actionable
+classifications or ranking. A known static route is not a correctness guarantee.
+This development-only prototype is not automatically copied to the separate
+public release repository.
+
+#### Opt-In Known-Call Continuation
+
+```sh
+python3 -m tools.geo_boundary_transition_probe /path/to/project \
+  --changed pkg/core.py --extra-call-hops 2 --max-extra-visits 1000
+```
+
+Default `--extra-call-hops 0` disables continuation. When enabled, each recorded
+depth boundary starts a breadth-first search along its existing untraversed
+call edge. Crossing that edge counts as extra hop 1. Only known calls are
+followed, toward the original scoped production files; dynamic targets are
+never guessed. Recovered tests not already recommended by fallback are marked
+`continuation_added`, `review_required`, and retain the original depth boundary.
+The witness starts at the boundary terminal, not at the test entry point.
+
+`--max-extra-visits` is a shared budget across all boundary searches in one
+analysis. Attempted node visits (including duplicates) consume it; each queue
+is also capped by the remaining visit budget. Cycles are suppressed within a
+search. Each search reports a witness, `hop_budget_exhausted`, and
+`visit_budget_exhausted`; these flags can coexist with a witness when another
+branch was truncated. Results under tight budgets can depend on boundary order.
+The budget does not cover snapshot extraction, graph indexing, or the existing
+static meeting calculation, and is not a wall-clock guarantee.
+
+Each search additionally reports its attempted `visits`, `peak_queue_size`,
+and `search_status`: `known_call_witness_found`, `visit_budget_exhausted`,
+`hop_budget_exhausted`, or `known_calls_exhausted`, in that precedence order.
+A found witness does not mean every branch was explored; consult both budget
+flags. `known_calls_exhausted` means only that this search exhausted reachable
+known call edges, not that a runtime dependency is absent. With no remaining
+visit budget a boundary is not enqueued: it has zero visits, zero queue size,
+and a visit-budget-exhausted status. Overall `peak_queue_size` is the maximum
+across sequential searches, not a sum.
+
+Stress regressions cover 5,001 outgoing branches under a ten-visit budget,
+a 51-node unrelated chain, cyclic/diamond paths, shared-budget boundary-order
+sensitivity, and successful witnesses alongside truncated branches.
+These are synthetic resource-accounting checks, not throughput benchmarks.
+With a tight shared budget the recovered test set can change when boundaries
+are reordered; no fairness or order-independent recall is promised.
+
+### Synthetic Development Evaluation
+
+```sh
+python3 -m tools.evaluate_geo_boundary_transitions
+```
+
+This local-only evaluator reuses the synthetic import-form fixtures and adds
+eight/nine-call chains, depth-boundary fallback recovery, dynamic dispatch
+inside a known provider, and a metadata-only negative control. Scenario labels
+are developer-authored, not independent or empirically verified test-impact
+labels. Source is parsed, never executed.
+
+The JSON reports per-case selected/recalled/missed/unnecessary tests for fallback
+off/on, aggregate precision/recall, added expected/unnecessary candidates, and
+checks for lost depth-boundary records, cleared candidate boundaries, and unsafe
+evidence promotions. Counts are case/test occurrences. The metadata-only
+negative assumes the provider's return behavior changes, not its name or
+existence; deleted-provider positives are review targets for broken imports.
+
+Current 10-case development results:
+
+| Mode | Expected | Selected | Recalled | Missed | Unnecessary |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Static selection | 7 | 2 | 2 | 5 | 0 |
+| Import-use fallback | 7 | 7 | 6 | 1 | 1 |
+
+Fallback adds four expected candidates and one unnecessary candidate. One
+nine-call candidate remains missed without a fallback reference. Lost depth
+boundaries, cleared candidate boundaries, and unsafe evidence promotions are all
+zero in this cohort. This exposes the coverage/noise trade-off of existing
+fallback; it does not demonstrate a new Möbius selection algorithm, calibrated
+confidence, real-project effectiveness, or improvement from geometric weighting.
+
+To compare optional continuation:
+
+```sh
+python3 -m tools.evaluate_geo_boundary_transitions \
+  --extra-call-hops 1 --max-extra-visits 1000
+```
+
+On this same 10-case cohort, continuation visits two boundary targets across
+the cases and adds the remaining expected nine-call candidate. The combined
+method selects eight case/test occurrences: seven expected and one unnecessary
+(the existing metadata-only fallback noise). It introduces no additional
+unnecessary candidate in this cohort and retains all original depth boundaries.
+These labels and cases were constructed for development; perfect recall here
+does not establish real-project coverage, and no noise reduction is demonstrated.
 
 ## Git Rename Tracking
 
