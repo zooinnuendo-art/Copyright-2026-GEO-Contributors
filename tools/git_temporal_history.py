@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import subprocess
 import tempfile
 from typing import Any, Sequence
@@ -17,6 +17,54 @@ from tools.temporal_graph_history import build_temporal_snapshot_record
 
 class GitHistoryError(ValueError):
     """Raised when Git history cannot be read within the declared contract."""
+
+
+def _validate_git_python_path(path: str) -> PurePosixPath:
+    if not isinstance(path, str) or not path or "\0" in path or "\\" in path:
+        raise GitHistoryError("Git contains an unsafe Python path")
+    relative = PurePosixPath(path)
+    windows = PureWindowsPath(path)
+    components = path.split("/")
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    if (
+        relative.is_absolute() or windows.is_absolute() or windows.drive
+        or not relative.parts or any(part in {"", ".", ".."} for part in components)
+        or any(
+            part.endswith((" ", "."))
+            or any(
+                character in '<>:"|?*'
+                or os.name == "nt" and (ord(character) < 32 or ord(character) == 127)
+                for character in part
+            )
+            or part.split(".", 1)[0].rstrip(" .").upper() in reserved
+            for part in components
+        )
+    ):
+        raise GitHistoryError("Git contains an unsafe Python path")
+    return relative
+
+
+def _validate_git_python_paths(paths: Sequence[str]) -> None:
+    files: dict[str, str] = {}
+    directories: set[str] = set()
+    for path in paths:
+        _validate_git_python_path(path)
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            prefix = "/".join(parts[:index]).casefold()
+            if prefix in files:
+                raise GitHistoryError("Git Python file path collides with a directory")
+            directories.add(prefix)
+        folded_path = path.casefold()
+        if folded_path in directories:
+            raise GitHistoryError("Git Python file path collides with a directory")
+        if folded_path in files and files[folded_path] != path:
+            raise GitHistoryError("Git Python paths collide on Windows")
+        files[folded_path] = path
 
 
 def _git(
@@ -111,9 +159,7 @@ def _tree_python_blobs(
             raise GitHistoryError("Git returned a malformed tree entry") from error
         if not path.endswith(".py"):
             continue
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise GitHistoryError("Git tree contains an unsafe Python path")
+        _validate_git_python_path(path)
         if object_type != "blob" or mode not in {"100644", "100755"}:
             issues.append({"kind": "unsupported_git_python_entry", "path": path, "mode": mode})
             continue
@@ -127,6 +173,7 @@ def _tree_python_blobs(
         if total_bytes > max_total_bytes:
             raise GitHistoryError("Python blob bytes exceeded the configured limit")
         blobs.append((path, object_id, size, mode))
+    _validate_git_python_paths([path for path, _object_id, _size, _mode in blobs])
     return blobs, issues
 
 
@@ -204,10 +251,15 @@ def _dependency_snapshot(
     )
     with tempfile.TemporaryDirectory(prefix="ain-git-snapshot-") as directory:
         root = Path(directory)
+        _validate_git_python_paths([path for path, _content, _mode in contents])
         for relative_name, content, _mode in contents:
-            relative = PurePosixPath(relative_name)
+            relative = _validate_git_python_path(relative_name)
             target = root.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.resolve().relative_to(root.resolve())
+            except ValueError as error:
+                raise GitHistoryError("Git Python path escapes the snapshot directory") from error
             target.write_bytes(content)
         try:
             graph = build_dependency_graph(

@@ -18,6 +18,8 @@ from tools.git_temporal_history import (
     _file_changes,
     _git,
     _resolve_commit,
+    _validate_git_python_path,
+    _validate_git_python_paths,
     extract_git_temporal_history,
 )
 from tools.temporal_ast_delta import build_python_ast_delta
@@ -37,13 +39,12 @@ def _index_entries(repo, timeout, metadata_limit):
         if stage != "0":
             raise GitHistoryError("staged review requires an index without unmerged entries")
         path = os.fsdecode(path)
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise GitHistoryError("index contains an unsafe path")
         if path.endswith(".py"):
+            _validate_git_python_path(path)
             if mode not in {"100644", "100755"} or set(oid) == {"0"}:
                 raise GitHistoryError(f"unsupported or intent-to-add Python index entry: {path}")
             entries.append((path, oid, mode))
+    _validate_git_python_paths([path for path, _oid, _mode in entries])
     return raw, entries
 
 

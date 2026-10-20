@@ -282,6 +282,11 @@ This is not a lock or atomic filesystem snapshot, and a change-and-revert
 during analysis cannot be detected. Index bytes and working-tree contents are
 not used as source code.
 
+Python paths from Git trees and the index are validated for safe POSIX and
+Windows extraction; Windows drive/UNC/backslash paths, reserved device names,
+and case-insensitive filename collisions are rejected before blob extraction
+or snapshot writes.
+
 This opt-in research probe compares the same snapshot with import-use test
 fallback off/on. Run it from this development checkout:
 
